@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=www-data
 Group=www-data
+Environment=VBOX_USER_HOME=/var/lib/virtualbox
 WorkingDirectory=/var/www/html
 ExecStart=/usr/bin/python3 /var/www/html/app.py
 Restart=on-failure

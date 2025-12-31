@@ -14,6 +14,10 @@ import json
 
 app = Flask(__name__)
 
+# VirtualBox expects a writable settings dir; web runs as www-data.
+VBOX_ENV = os.environ.copy()
+VBOX_ENV["VBOX_USER_HOME"] = "/var/lib/virtualbox"
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,6 +53,39 @@ def clear_upload_folder():
                 print(f"Deleted directory: {file_path}")
         except Exception as e:
             print(f'Failed to delete {file_path}. Reason: {e}')
+
+def _run_vbox(args):
+    try:
+        result = subprocess.run(
+            ["VBoxManage"] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=VBOX_ENV,
+            timeout=5
+        )
+        if result.returncode == 0:
+            return result
+    except subprocess.TimeoutExpired:
+        result = None
+
+    return subprocess.run(
+        ["sudo", "VBoxManage"] + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=VBOX_ENV,
+        timeout=20
+    )
+
+def _get_vm_state():
+    result = _run_vbox(["showvminfo", "sandbox", "--machinereadable"])
+    if result.returncode != 0:
+        return None, result.stderr.strip()
+    for line in result.stdout.splitlines():
+        if line.startswith("VMState="):
+            return line.split("=", 1)[1].strip().strip('"'), None
+    return None, "VMState not found"
 
 @app.route('/api/upload', methods=['POST'])
 @jwt_required()
@@ -110,25 +147,28 @@ def api_malware_retrieval():
 def mitre_attack_execution():
     try:
         # Retrieve the technique ID sent from the front-end
-        data = request.get_json()
-        technique_id = data['id']
+        data = request.get_json(silent=True)
+        technique_id = data.get('id') if data else None
+        if not technique_id:
+            return jsonify({'status': 'error', 'message': 'Missing id'}), 400
+        state, state_error = _get_vm_state()
+        if state_error:
+            return jsonify({'status': 'error', 'message': state_error}), 500
+        if state != "running":
+            return jsonify({'status': 'error', 'message': f'VM not running (state={state})'}), 400
 
         # Format the PowerShell command
         powershell_command = f"\"& {{Import-Module 'C:\\\\AtomicRedTeam\\\\invoke-atomicredteam\\\\Invoke-AtomicRedTeam.psd1' -Force; Invoke-AtomicTest {technique_id}}}\""
 
         # Execute the command using VBoxManage
-        subprocess.run(
-            ['VBoxManage', 'guestcontrol', 'sandbox', '--username', 'oem', '--password', 'oem', 'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '--', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', powershell_command],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        result = _run_vbox(['guestcontrol', 'sandbox', '--username', 'oem', '--password', 'oem', 'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '--', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', powershell_command])
+        if result.returncode != 0:
+            return jsonify({'status': 'error', 'message': result.stderr.strip()}), 500
 
         return jsonify({'status': 'success'}), 200
 
     except subprocess.CalledProcessError as e:
-        # Output the error message
-        error_message = e.stderr.decode()
+        error_message = e.stderr.decode() if e.stderr else str(e)
         return jsonify({'status': 'error', 'message': error_message}), 500
 
 
@@ -142,19 +182,21 @@ def api_mitre_attack_execution():
     technique_id = request.args.get('technique_id')
     if not technique_id:
         return jsonify({"msg": "technique_id is required"}), 400
+    state, state_error = _get_vm_state()
+    if state_error:
+        return jsonify({"msg": state_error}), 500
+    if state != "running":
+        return jsonify({"msg": f"VM not running (state={state})"}), 400
 
   
     powershell_command = f"\"& {{Import-Module 'C:\\\\AtomicRedTeam\\\\invoke-atomicredteam\\\\Invoke-AtomicRedTeam.psd1' -Force; Invoke-AtomicTest {technique_id}}}\""
 
     # Execute the command using VBoxManage
     try:
-        result = subprocess.run(
-            ['VBoxManage', 'guestcontrol', 'sandbox', '--username', 'oem', '--password', 'oem', 'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '--', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', powershell_command],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        return jsonify({"msg": "Command executed successfully", "output": result.stdout.decode(), "error": result.stderr.decode()}), 200
+        result = _run_vbox(['guestcontrol', 'sandbox', '--username', 'oem', '--password', 'oem', 'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', '--', 'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', powershell_command])
+        if result.returncode != 0:
+            return jsonify({"msg": "Command execution failed", "error": result.stderr.strip()}), 500
+        return jsonify({"msg": "Command executed successfully", "output": result.stdout, "error": result.stderr}), 200
     except subprocess.CalledProcessError as e:
         return jsonify({"msg": "Command execution failed", "error": str(e)}), 500
 
@@ -186,8 +228,9 @@ def vm_state():
  
     script_path = '/var/www/html/scripts/manageVM.py'
 
- 
-    result = subprocess.run(['python3', script_path, 'state'], capture_output=True, text=True)
+    env = os.environ.copy()
+    env["VBOX_FORCE_SUDO"] = "1"
+    result = subprocess.run(['python3', script_path, 'state'], capture_output=True, text=True, env=env)
 
  
     if result.returncode == 0:
@@ -202,10 +245,14 @@ def vm_state():
 def vm_ip():
     script_path = '/var/www/html/scripts/manageVM.py'
 
-    result = subprocess.run(['python3', script_path, 'ip'], capture_output=True, text=True)
+    env = os.environ.copy()
+    env["VBOX_FORCE_SUDO"] = "1"
+    result = subprocess.run(['python3', script_path, 'ip'], capture_output=True, text=True, env=env)
 
     if result.returncode == 0:
         ip_address = result.stdout.strip().split(' ')[-1]
+        if not ip_address or ip_address == "=":
+            return jsonify({"error": "VM IP unavailable"}), 400
         return jsonify({"ip": ip_address}), 200
     else:
         return jsonify({"error": result.stderr}), 400
@@ -218,16 +265,31 @@ def index():
 @cross_origin()
 def restore_snapshot():
     script_path = '/var/www/html/scripts/manageVM.py'
-    command = ["sudo", "python3", script_path, "restore"]
+    env = os.environ.copy()
+    env["VBOX_FORCE_SUDO"] = "1"
+    command = ["python3", script_path, "restore"]
     
     try:
-        
-        subprocess.run(command, check=True)
-        print("The script has been executed successfully.") 
+        result = subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+        print("The script has been executed successfully.")
         return jsonify({"message": "The VM has been restored."}), 200
     except subprocess.CalledProcessError as e:
         print(f"Error during script execution: {e}")  
-        return jsonify({"error": "An error has occurred while executing the script.", "details": str(e)}), 500
+        return jsonify({"error": "An error has occurred while executing the script.", "details": e.stderr}), 500
+
+@app.route('/take_snapshot', methods=['POST'])
+@cross_origin()
+def take_snapshot():
+    script_path = '/var/www/html/scripts/manageVM.py'
+    env = os.environ.copy()
+    env["VBOX_FORCE_SUDO"] = "1"
+    command = ["python3", script_path, "snapshot"]
+
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True, env=env)
+        return jsonify({"message": "Snapshot created successfully."}), 200
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": "An error has occurred while creating the snapshot.", "details": e.stderr}), 500
 
 @app.route('/upload_to_vm', methods=['POST'])
 @cross_origin()
@@ -469,10 +531,12 @@ def api_execute_usecase():
 def poweroff_vm_route():
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'poweroff'], check=True)
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        subprocess.run(['python3', script_path, 'poweroff'], check=True, capture_output=True, text=True, env=env)
         return jsonify({"message": "VM successfully powered off."}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while powering off the VM.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while powering off the VM.", "details": e.stderr}), 500
 
 @app.route('/api/poweroff_vm', methods=['POST'])
 @jwt_required(optional=True)
@@ -482,10 +546,12 @@ def api_poweroff_vm_route():
 
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'poweroff'], check=True)
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        subprocess.run(['python3', script_path, 'poweroff'], check=True, capture_output=True, text=True, env=env)
         return jsonify({"message": "VM successfully powered off."}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while powering off the VM.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while powering off the VM.", "details": e.stderr}), 500
 
 
 @app.route('/start_vm_headless', methods=['POST'])
@@ -493,10 +559,24 @@ def api_poweroff_vm_route():
 def start_vm_headless_route():
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'startheadless'], check=True)
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        subprocess.run(['python3', script_path, 'startheadless'], check=True, capture_output=True, text=True, env=env)
         return jsonify({"message": "VM successfully started in headless mode."}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while starting the VM in headless mode.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while starting the VM in headless mode.", "details": e.stderr}), 500
+
+@app.route('/reboot_vm', methods=['POST'])
+@cross_origin()
+def reboot_vm_route():
+    script_path = '/var/www/html/scripts/manageVM.py'
+    try:
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        subprocess.run(['python3', script_path, 'reboot'], check=True, capture_output=True, text=True, env=env)
+        return jsonify({"message": "VM successfully rebooted."}), 200
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": "Error occurred while rebooting the VM.", "details": e.stderr}), 500
     
 @app.route('/api/start_vm_headless', methods=['POST'])
 @jwt_required(optional=True)
@@ -506,10 +586,12 @@ def api_start_vm_headless_route():
 
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'startheadless'], check=True)
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        subprocess.run(['python3', script_path, 'startheadless'], check=True, capture_output=True, text=True, env=env)
         return jsonify({"message": "VM successfully started in headless mode."}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while starting the VM in headless mode.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while starting the VM in headless mode.", "details": e.stderr}), 500
 
 
 @app.route('/disable_av', methods=['POST'])
@@ -517,10 +599,12 @@ def api_start_vm_headless_route():
 def disable_av():
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'disableav'], check=True)
-        return jsonify({"message": "Antivirus successfully disabled."}), 200
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        result = subprocess.run(['python3', script_path, 'disableav'], check=True, capture_output=True, text=True, env=env)
+        return jsonify({"message": "Antivirus successfully disabled.", "details": result.stdout.strip()}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while disabling the antivirus.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while disabling the antivirus.", "details": e.stderr}), 500
 
 
 @app.route('/enable_av', methods=['POST'])
@@ -528,10 +612,12 @@ def disable_av():
 def enable_av():
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'enableav'], check=True)
-        return jsonify({"message": "Antivirus successfully enabled."}), 200
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        result = subprocess.run(['python3', script_path, 'enableav'], check=True, capture_output=True, text=True, env=env)
+        return jsonify({"message": "Antivirus successfully enabled.", "details": result.stdout.strip()}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while enabling the antivirus.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while enabling the antivirus.", "details": e.stderr}), 500
 
 
 @app.route('/restart_winlogbeat', methods=['POST'])
@@ -539,10 +625,24 @@ def enable_av():
 def restart_winlogbeat():
     script_path = '/var/www/html/scripts/manageVM.py'
     try:
-        subprocess.run(['sudo', 'python3', script_path, 'restartwinlogbeat'], check=True)
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        subprocess.run(['python3', script_path, 'restartwinlogbeat'], check=True, capture_output=True, text=True, env=env)
         return jsonify({"message": "Winlogbeat service successfully restarted."}), 200
     except subprocess.CalledProcessError as e:
-        return jsonify({"error": "Error occurred while restarting Winlogbeat service.", "details": str(e)}), 500
+        return jsonify({"error": "Error occurred while restarting Winlogbeat service.", "details": e.stderr}), 500
+
+@app.route('/av_status', methods=['GET'])
+@cross_origin()
+def av_status():
+    script_path = '/var/www/html/scripts/manageVM.py'
+    try:
+        env = os.environ.copy()
+        env["VBOX_FORCE_SUDO"] = "1"
+        result = subprocess.run(['python3', script_path, 'avstatus'], check=True, capture_output=True, text=True, env=env)
+        return jsonify({"status": "success", "details": result.stdout.strip()}), 200
+    except subprocess.CalledProcessError as e:
+        return jsonify({"status": "error", "details": e.stderr}), 500
 
 
 @app.route('/convert_sigma', methods=['POST'])
@@ -594,17 +694,24 @@ def forensic_acquisition():
 
     script_path = '/var/www/html/scripts/forensic_acquisition.py'
 
-    result = subprocess.run(['sudo', 'python3', script_path, acquisition_type], capture_output=True, text=True)
+    env = os.environ.copy()
+    env["VBOX_FORCE_SUDO"] = "1"
+    result = subprocess.run(['python3', script_path, acquisition_type], capture_output=True, text=True, env=env)
 
     if result.returncode == 0:
         return jsonify({"output": result.stdout}), 200
     else:
-        return jsonify({"error": result.stderr}), 400
+        details = result.stderr.strip() or result.stdout.strip()
+        return jsonify({"error": details}), 400
 
 @app.route('/download/<filename>', methods=['GET'])
 @cross_origin()
 def download_file(filename):
-    directory = '/var/www/html/Downloaded/Forensic'
+    directory = '/tmp/forensic'
+    file_path = os.path.join(directory, filename)
+    if os.path.exists(file_path) and not os.access(file_path, os.R_OK):
+        subprocess.run(["sudo", "-n", "/bin/chown", "www-data:www-data", file_path], check=False)
+        subprocess.run(["sudo", "-n", "/bin/chmod", "0644", file_path], check=False)
     return send_from_directory(directory, filename)
 
 

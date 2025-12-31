@@ -195,6 +195,8 @@ $vmInfo['IP'] = $vmIP;
     <link rel="stylesheet" href="css/main.css?v=<?= filemtime('css/main.css') ?>">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+</script>
 </head>
 <body>
 
@@ -346,56 +348,16 @@ $vmInfo['IP'] = $vmIP;
                         $vmState = 'Unknown';
                         $vmSnapshots = 'None';
                         $vmIP = $vmInfo['IP'] ?? 'Unknown';
-                        
-                        $mainDataString = '';
-                        foreach ($vmInfo as $key => $value) {
-                            if ($key === 'IP') continue;
-                            
-                            if (is_string($value) && stripos($value, 'sandbox') !== false && stripos($value, 'State:') !== false) {
-                                $mainDataString = $value;
-                                break;
-                            } elseif (is_array($value)) {
-                                foreach ($value as $subValue) {
-                                    if (is_string($subValue) && stripos($subValue, 'sandbox') !== false && stripos($subValue, 'State:') !== false) {
-                                        $mainDataString = $subValue;
-                                        break 2;
-                                    }
-                                }
-                            }
-                        }
-                        
-                        if (!empty($mainDataString)) {
-                            if (preg_match('/^([^S]+)State:/', $mainDataString, $matches)) {
-                                $vmName = trim($matches[1]);
-                            }
-                            
-                            if (preg_match('/State:\s*([^(]+)(?:\s*\(|Snapshots:|$)/', $mainDataString, $matches)) {
-                                $vmState = trim($matches[1]);
-                            }
-                            
-                            if (preg_match('/Snapshots:\s*Name:\s*([^*]+)/', $mainDataString, $matches)) {
-                                $vmSnapshots = trim($matches[1]);
-                                $vmSnapshots = rtrim($vmSnapshots, ' )');
-                            } elseif (stripos($mainDataString, 'Snapshots:') !== false && stripos($mainDataString, 'Name:') === false) {
-                                $vmSnapshots = 'No snapshots available';
-                            }
-                        }
-                        
-                        if ($vmName === 'Unknown' || $vmState === 'Unknown') {
-                            foreach ($vmInfo as $key => $value) {
-                                if ($key === 'IP') continue;
-                                
-                                if (is_string($value)) {
-                                    if (stripos($value, 'sandbox') !== false && $vmName === 'Unknown') {
-                                        $vmName = 'sandbox';
-                                    }
-                                    if ((stripos($value, 'powered off') !== false || stripos($value, 'running') !== false) && $vmState === 'Unknown') {
-                                        if (stripos($value, 'powered off') !== false) {
-                                            $vmState = 'powered off';
-                                        } elseif (stripos($value, 'running') !== false) {
-                                            $vmState = 'running';
-                                        }
-                                    }
+
+                        if (isset($vmInfo['output']) && is_string($vmInfo['output'])) {
+                            $lines = preg_split('/\r?\n/', trim($vmInfo['output']));
+                            foreach ($lines as $line) {
+                                if (stripos($line, 'Name:') === 0) {
+                                    $vmName = trim(substr($line, strlen('Name:')));
+                                } elseif (stripos($line, 'State:') === 0) {
+                                    $vmState = trim(substr($line, strlen('State:')));
+                                } elseif (stripos($line, 'Snapshots:') === 0) {
+                                    $vmSnapshots = trim(substr($line, strlen('Snapshots:')));
                                 }
                             }
                         }
@@ -462,6 +424,12 @@ $vmInfo['IP'] = $vmIP;
                         <button id="startVmButton" onclick="confirmAction('start', 'Start VM Headless', 'This will start the virtual machine in headless mode (no GUI).')">
                             <i class="fas fa-play"></i> Start VM Headless
                         </button>
+                        <button id="snapshotButton" onclick="confirmAction('snapshot', 'Take VM Snapshot', 'This will create a new snapshot of the virtual machine.')">
+                            <i class="fas fa-camera"></i> Take Snapshot
+                        </button>
+                        <button id="rebootButton" onclick="confirmAction('reboot', 'Reboot VM', 'This will reboot the virtual machine immediately.')">
+                            <i class="fas fa-sync-alt"></i> Reboot VM
+                        </button>
                     </div>
                     
                     <!-- Antivirus Toggle -->
@@ -483,6 +451,12 @@ $vmInfo['IP'] = $vmIP;
                         <i class="fas fa-hdd"></i> Disk Acquisition
                     </button>
                     <div id="acquisitionStatus"></div>
+                    <button class="forensic-button" id="memoryDownloadButton" style="display: none;" onclick="downloadFile('sandbox.dmp')">
+                        <i class="fas fa-download"></i> Download Memory Dump
+                    </button>
+                    <button class="forensic-button" id="diskDownloadButton" style="display: none;" onclick="downloadFile('sandbox.vdi')">
+                        <i class="fas fa-download"></i> Download Disk Image
+                    </button>
                 </div>
             </div>
         </div>
@@ -646,6 +620,12 @@ function executeAction(actionType) {
         case 'start':
             startVMHeadless();
             break;
+        case 'snapshot':
+            takeSnapshot();
+            break;
+        case 'reboot':
+            rebootVM();
+            break;
         default:
             console.error('Action inconnue:', actionType);
     }
@@ -657,11 +637,12 @@ function restoreSnapshot() {
     button.innerHTML = '<i class="fas fa-sync fa-spin"></i> Restoring...';
     button.disabled = true;
 
-    fetch('http://' + window.location.hostname + ':5000/restore_snapshot', {
+    fetch('scripts/php/vm_action.php', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ action: 'restore' })
     })
     .then(response => {
         if (!response.ok) {
@@ -692,11 +673,12 @@ function powerOffVM() {
     button.innerHTML = '<i class="fas fa-sync fa-spin"></i> Powering Off...';
     button.disabled = true;
 
-    fetch('http://' + window.location.hostname + ':5000/poweroff_vm', {
+    fetch('scripts/php/vm_action.php', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ action: 'poweroff' })
     })
     .then(response => {
         if (!response.ok) {
@@ -726,11 +708,12 @@ function startVMHeadless() {
     button.innerHTML = '<i class="fas fa-sync fa-spin"></i> Starting...';
     button.disabled = true;
 
-    fetch('http://' + window.location.hostname + ':5000/start_vm_headless', {
+    fetch('scripts/php/vm_action.php', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ action: 'start' })
     })
     .then(response => {
         if (!response.ok) {
@@ -751,6 +734,41 @@ function startVMHeadless() {
     .catch(error => {
         console.error('Error:', error);
         createToast('error', 'Connection Error', 'Failed to start the VM');
+        updateButtons();
+    });
+}
+
+function takeSnapshot() {
+    var button = document.getElementById('snapshotButton');
+    button.innerHTML = '<i class="fas fa-sync fa-spin"></i> Taking Snapshot...';
+    button.disabled = true;
+
+    fetch('scripts/php/vm_action.php', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ action: 'snapshot' })
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Network response was not ok: ' + response.statusText);
+        }
+        return response.json();
+    })
+    .then(data => {
+        if (data.message) {
+            createToast('success', 'Snapshot Created', data.message);
+        } else if (data.error) {
+            createToast('error', 'Snapshot Failed', data.error);
+        }
+        setTimeout(() => {
+            window.location.reload();
+        }, 2000);
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        createToast('error', 'Connection Error', 'Failed to create snapshot');
         updateButtons();
     });
 }
@@ -810,6 +828,7 @@ function disableAntivirus() {
 function memoryAcquisition() {
     document.getElementById('acquisitionStatus').innerText = 'Memory acquisition in progress...';
     createToast('info', 'Starting Acquisition', 'Memory acquisition in progress...');
+    document.getElementById('memoryDownloadButton').style.display = 'none';
     
     fetch('http://' + window.location.hostname + ':5000/forensic_acquisition', {
         method: 'POST',
@@ -823,7 +842,7 @@ function memoryAcquisition() {
         if (data.output) {
             let filename = 'sandbox.dmp';
             createToast('success', 'Memory Acquired', 'Memory dump ready for download');
-            downloadFile(filename);
+            document.getElementById('memoryDownloadButton').style.display = 'inline-flex';
         } else {
             createToast('error', 'Acquisition Failed', data.error || 'Unknown error');
             document.getElementById('acquisitionStatus').innerText = '';
@@ -839,6 +858,7 @@ function memoryAcquisition() {
 function diskAcquisition() {
     document.getElementById('acquisitionStatus').innerText = 'Disk acquisition in progress...';
     createToast('info', 'Starting Acquisition', 'Disk acquisition in progress...');
+    document.getElementById('diskDownloadButton').style.display = 'none';
     
     fetch('http://' + window.location.hostname + ':5000/forensic_acquisition', {
         method: 'POST',
@@ -853,6 +873,7 @@ function diskAcquisition() {
             let filename = 'sandbox.vdi';
             createToast('success', 'Disk Acquired', 'Disk image ready for download');
             downloadFile(filename);
+            document.getElementById('diskDownloadButton').style.display = 'inline-flex';
         } else {
             createToast('error', 'Acquisition Failed', data.error || 'Unknown error');
             document.getElementById('acquisitionStatus').innerText = '';
@@ -882,8 +903,48 @@ function updateButtons() {
     document.getElementById('powerOffButton').disabled = false;
     document.getElementById('startVmButton').innerHTML = '<i class="fas fa-play"></i> Start VM Headless';
     document.getElementById('startVmButton').disabled = false;
+    document.getElementById('snapshotButton').innerHTML = '<i class="fas fa-camera"></i> Take Snapshot';
+    document.getElementById('snapshotButton').disabled = false;
 }
+
+function rebootVM() {
+    var button = document.getElementById('rebootButton');
+    button.innerHTML = '<i class="fas fa-sync fa-spin"></i> Rebooting...';
+    button.disabled = true;
+
+    fetch('scripts/php/vm_action.php', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ action: 'reboot' })
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error('Network response was not ok: ' + response.statusText);
+        }
+        return response.json();
+    })
+    .then(data => {
+        if (data.message) {
+            createToast('success', 'VM Rebooted', data.message);
+        } else if (data.error) {
+            createToast('error', 'Reboot Failed', data.error);
+        }
+        setTimeout(() => {
+            window.location.reload();
+        }, 2000);
+    })
+    .catch(error => {
+        console.error('Error:', error);
+        createToast('error', 'Connection Error', 'Failed to reboot the VM');
+        updateButtons();
+    });
+}
+
 </script>
 
 </body>
 </html>
+
+
