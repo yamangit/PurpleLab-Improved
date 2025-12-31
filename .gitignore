@@ -1,0 +1,21 @@
+# Runtime/cache
+cache/
+Downloaded/
+uploads/
+
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.*
+**/terraform.tfvars
+**/terraform.log
+
+# Vagrant
+.vagrant/
+
+# Local
+session.txt
+
+# OS
+.DS_Store

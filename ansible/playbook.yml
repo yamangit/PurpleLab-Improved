@@ -1,0 +1,74 @@
+---
+- name: Installation de PurpleLab
+  hosts: all
+  become: yes
+  vars:
+    # Username to own local files (admin.txt, repo checkout, VM storage, etc.).
+    # When running via sudo, this will resolve to the invoking user (e.g. "vagrant").
+    purplelab_user: "{{ lookup('env', 'SUDO_USER') | default('purplelab', true) }}"
+    purplelab_home: "{{ (purplelab_user == 'root') | ternary('/root', '/home/' + purplelab_user) }}"
+    purplelab_repo_path: "{{ purplelab_home }}/PurpleLab"
+    db_user: "toor"
+    db_pass: "root"
+    db_name: "purplelab"
+    encryption_key: "{{ lookup('password', '/dev/null chars=ascii_letters,digits,hexdigits length=32') }}"
+    admin_password: "{{ lookup('password', '/dev/null chars=ascii_letters,digits,special length=12') }}"
+
+  roles:
+    - { role: common, tags: ['common'] }
+    - { role: webserver, tags: ['webserver'] }
+    - { role: database, tags: ['database'] }
+
+- name: Installation d'OpenSearch
+  hosts: opensearch_nodes
+  become: true
+  gather_facts: true
+  vars:
+    purplelab_user: "{{ lookup('env', 'SUDO_USER') | default('purplelab', true) }}"
+    purplelab_home: "{{ (purplelab_user == 'root') | ternary('/root', '/home/' + purplelab_user) }}"
+    purplelab_repo_path: "{{ purplelab_home }}/PurpleLab"
+  roles:
+    - role: opensearch/opensearch
+  tags: [opensearch]
+
+- name: Installation d'OpenSearch Dashboards
+  hosts: opensearch_dashboards_nodes
+  become: true
+  gather_facts: true
+  vars:
+    purplelab_user: "{{ lookup('env', 'SUDO_USER') | default('purplelab', true) }}"
+    purplelab_home: "{{ (purplelab_user == 'root') | ternary('/root', '/home/' + purplelab_user) }}"
+    purplelab_repo_path: "{{ purplelab_home }}/PurpleLab"
+  roles:
+    - role: opensearch_dashboards
+  tags: [opensearch]
+
+- name: Suite de l'installation PurpleLab (VirtualBox)
+  hosts: all
+  become: yes
+  vars:
+    purplelab_user: "{{ lookup('env', 'SUDO_USER') | default('purplelab', true) }}"
+    purplelab_home: "{{ (purplelab_user == 'root') | ternary('/root', '/home/' + purplelab_user) }}"
+    purplelab_repo_path: "{{ purplelab_home }}/PurpleLab"
+  roles:
+    - { role: virtualbox, tags: ['virtualbox'] }
+
+  post_tasks:
+    - name: Configuration de la VM Windows
+      import_tasks: roles/virtualbox/tasks/configure_vm_playbook.yml
+      tags: 
+        - configure_vm
+        - vm_config
+        - virtualbox
+      vars:
+        ansible_become: no
+
+    - name: Correction des permissions pour composer
+      file:
+        path: /var/www/html
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0775'
+        recurse: yes
+      tags: [webserver]

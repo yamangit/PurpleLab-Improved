@@ -1,0 +1,737 @@
+---
+- name: Définir le nom de la VM
+  set_fact:
+    vm_name: "sandbox"
+
+- name: Obtenir l'IP de la VM Windows
+  shell: |
+    sudo VBoxManage guestproperty enumerate "{{ vm_name }}" | grep "IP" | grep -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" || true
+  register: vm_ip_result
+  until: vm_ip_result.stdout != ""
+  retries: 30
+  delay: 10
+  changed_when: false
+  environment:
+    VBOX_USER_HOME: "/var/lib/virtualbox"
+
+- name: Afficher l'adresse IP de la VM
+  debug:
+    msg: "L'adresse IP de la VM {{ vm_name }} est {{ vm_ip_result.stdout }}"
+  when: vm_ip_result.stdout != ""
+
+- name: Attente que la VM soit accessible
+  wait_for:
+    host: "{{ vm_ip_result.stdout }}"
+    port: 5985
+    timeout: 300
+    delay: 10
+  when: vm_ip_result.stdout != ""
+
+- name: Configurer les règles de pare-feu pour WinRM
+  win_shell: |
+    netsh advfirewall firewall add rule name="WinRM-HTTP" dir=in localport=5985 protocol=TCP action=allow
+    netsh advfirewall firewall add rule name="WinRM-HTTPS" dir=in localport=5986 protocol=TCP action=allow
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  become: no
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Désactiver la politique de complexité des mots de passe
+  win_shell: |
+    try {
+      # Désactiver la politique de complexité des mots de passe
+      secedit /export /cfg C:\secpol.cfg
+      (Get-Content C:\secpol.cfg) -replace "PasswordComplexity = 1", "PasswordComplexity = 0" | Out-File C:\secpol.cfg
+      secedit /configure /db C:\Windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY
+      Remove-Item -Path C:\secpol.cfg -Force
+      Write-Output "Politique de complexité des mots de passe désactivée"
+    } catch {
+      Write-Output "Erreur lors de la désactivation de la politique de complexité: $_"
+      exit 1
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  become: no
+  register: disable_policy_result
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Afficher le résultat de la désactivation de la politique
+  debug:
+    var: disable_policy_result.stdout_lines
+  when: disable_policy_result is defined
+
+- name: Création de l'utilisateur administrateur OEM via PowerShell
+  win_shell: |
+    try {
+      $password = ConvertTo-SecureString "oem" -AsPlainText -Force
+      New-LocalUser -Name "oem" -Password $password -FullName "OEM Admin" -Description "OEM Administrator" -ErrorAction Stop
+      Add-LocalGroupMember -Group "Administrators" -Member "oem" -ErrorAction Stop
+      Write-Output "Utilisateur oem créé avec succès"
+    } catch {
+      Write-Output "Erreur lors de la création de l'utilisateur: $_"
+      if ($_.Exception.Message -like "*nom d'utilisateur existe déjà*" -or $_.Exception.Message -like "*already exists*") {
+        Write-Output "L'utilisateur oem existe déjà"
+        exit 0
+      } else {
+        exit 1
+      }
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  become: no
+  register: create_user_result
+  vars:
+    ansible_user: vagrant
+    ansible_password: vagrant
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Afficher le résultat de la création de l'utilisateur
+  debug:
+    var: create_user_result.stdout_lines
+  when: create_user_result is defined
+
+- name: Définir les identifiants WinRM finaux
+  set_fact:
+    winrm_user_final: "oem"
+    winrm_pass_final: "oem"
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  delegate_facts: true
+
+- name: Activer RDP et ICMP sur la VM Windows
+  win_shell: |
+    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+    Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+    netsh advfirewall firewall add rule name="ICMPv4-In" dir=in action=allow protocol=icmpv4:8,any
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+# -------------------------------------
+# Software installation
+# -------------------------------------
+
+####################################################################
+# FIX 2 — CORRECT .NET 4.8 HANDLING
+####################################################################
+
+- name: Check .NET Framework 4.8 via registry
+  win_reg_stat:
+    path: HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full
+    name: Release
+  register: dotnet_release
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Download .NET Framework 4.8
+  win_get_url:
+    url: https://go.microsoft.com/fwlink/?linkid=2088631
+    dest: C:\Windows\Temp\ndp48.exe
+  when: dotnet_release.value | default(0) | int < 528040
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Install .NET Framework 4.8
+  win_command: C:\Windows\Temp\ndp48.exe /q /norestart
+  when: dotnet_release.value | default(0) | int < 528040
+  register: dotnet_install
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  failed_when: dotnet_install.rc not in [0,3010]
+
+- name: Reboot after .NET install
+  win_reboot:
+  when: dotnet_install is defined and (dotnet_install.rc | default(0)) == 3010
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Installer Chocolatey
+  win_chocolatey:
+    name: chocolatey
+    state: present
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+
+- name: Installer Python avec Chocolatey
+  win_chocolatey:
+    name: python
+    state: present
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Vérifier la version de Python
+  win_command: python --version
+  register: python_version
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Afficher la version de Python installée
+  debug:
+    var: python_version.stdout
+  when: python_version is defined
+
+- name: Télécharger Sysmon
+  win_get_url:
+    url: https://download.sysinternals.com/files/Sysmon.zip
+    dest: C:\Windows\Temp\Sysmon.zip
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Extraire Sysmon
+  win_unzip:
+    src: C:\Windows\Temp\Sysmon.zip
+    dest: C:\Windows\Temp\Sysmon
+    creates: C:\Windows\Temp\Sysmon\Sysmon64.exe
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Télécharger la configuration Sysmon de SwiftOnSecurity
+  win_get_url:
+    url: https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml
+    dest: C:\Windows\Temp\Sysmon\sysmonconfig-export.xml
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Installer Sysmon avec la configuration
+  win_command: C:\Windows\Temp\Sysmon\Sysmon64.exe -accepteula -i C:\Windows\Temp\Sysmon\sysmonconfig-export.xml
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: sysmon_install
+  ignore_errors: yes
+
+- name: Vérifier l'installation de Sysmon
+  win_command: C:\Windows\Temp\Sysmon\Sysmon64.exe -c
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: sysmon_check
+  when: sysmon_install is defined
+
+- name: Afficher le statut de Sysmon
+  debug:
+    var: sysmon_check.stdout_lines
+  when: sysmon_check is defined
+
+# -------------------------------------
+# Installation et configuration de Winlogbeat OSS 7.12.1
+# -------------------------------------
+
+- name: Obtenir l'adresse IP du serveur hôte
+  shell: hostname -I | awk '{print $1}'
+  register: host_ip
+  changed_when: false
+  delegate_to: 127.0.0.1
+
+- name: Télécharger Winlogbeat OSS 7.12.1 (compatible avec OpenSearch)
+  win_get_url:
+    url: https://artifacts.elastic.co/downloads/beats/winlogbeat/winlogbeat-oss-7.12.1-windows-x86_64.zip
+    dest: C:\Windows\Temp\winlogbeat.zip
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Créer le répertoire pour Winlogbeat
+  win_file:
+    path: C:\Program Files\Winlogbeat
+    state: directory
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Extraire Winlogbeat OSS
+  win_unzip:
+    src: C:\Windows\Temp\winlogbeat.zip
+    dest: C:\Windows\Temp\
+    creates: C:\Windows\Temp\winlogbeat-oss-7.12.1-windows-x86_64
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Lister le contenu du répertoire temporaire (pour le débogage)
+  win_shell: |
+    Get-ChildItem C:\Windows\Temp\*winlogbeat* -Recurse | Select-Object FullName
+  register: temp_dir_listing
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Afficher le contenu du répertoire temporaire
+  debug:
+    var: temp_dir_listing.stdout_lines
+
+- name: Copier les fichiers Winlogbeat OSS dans le répertoire d'installation
+  win_shell: |
+    $source = Get-ChildItem C:\Windows\Temp\*winlogbeat* -Directory | Select-Object -First 1 -ExpandProperty FullName
+    if ($source) {
+      Copy-Item -Path "$source\*" -Destination "C:\Program Files\Winlogbeat" -Recurse -Force
+      Write-Output "Fichiers copiés depuis $source"
+    } else {
+      Write-Error "Aucun répertoire Winlogbeat trouvé dans C:\Windows\Temp"
+      exit 1
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Configurer Winlogbeat OSS pour envoyer les logs à OpenSearch
+  win_template:
+    src: "{{ playbook_dir }}/roles/virtualbox/templates/winlogbeat.yml.j2"
+    dest: C:\Program Files\Winlogbeat\winlogbeat.yml
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    opensearch_host: "{{ host_ip.stdout }}"
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Installer Winlogbeat OSS en tant que service Windows
+  win_shell: |
+    cd "C:\Program Files\Winlogbeat"
+    .\install-service-winlogbeat.ps1
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Démarrer le service Winlogbeat OSS
+  win_service:
+    name: winlogbeat
+    state: started
+    start_mode: auto
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Vérifier l'état du service Winlogbeat OSS
+  win_service:
+    name: winlogbeat
+  register: winlogbeat_status
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Afficher l'état du service Winlogbeat OSS
+  debug:
+    var: winlogbeat_status
+  when: winlogbeat_status is defined
+
+# -------------------------------------
+# Configuration des exclusions Windows Defender et installation d'Invoke-AtomicRedTeam
+# -------------------------------------
+
+- name: Ajouter des exclusions Windows Defender pour AtomicRedTeam et dossiers utilisateur
+  win_shell: |
+    try {
+      Add-MpPreference -ExclusionPath "C:\AtomicRedTeam" -ErrorAction Stop
+      Add-MpPreference -ExclusionPath "C:\Users\oem\Documents" -ErrorAction Stop
+      Add-MpPreference -ExclusionPath "C:\Windows\Temp\atomic-red-team-master" -ErrorAction Stop
+      Write-Output "Exclusions Windows Defender ajoutées avec succès"
+    } catch {
+      Write-Output "Erreur lors de l'ajout des exclusions Windows Defender: $_"
+      exit 1
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: defender_exclusions_result
+- name: Afficher le résultat des exclusions Windows Defender
+  debug:
+    var: defender_exclusions_result.stdout_lines
+  when: defender_exclusions_result is defined
+
+- name: Créer le dossier samples dans Documents
+  win_file:
+    path: C:\Users\oem\Documents\samples
+    state: directory
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Créer le dossier malware_upload dans Documents
+  win_file:
+    path: C:\Users\oem\Documents\malware_upload
+    state: directory
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Créer le dossier upload dans Documents
+  win_file:
+    path: C:\Users\oem\Documents\upload
+    state: directory
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Créer le dossier AtomicRedTeam
+  win_file:
+    path: C:\AtomicRedTeam
+    state: directory
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Créer les sous-dossiers pour AtomicRedTeam
+  win_file:
+    path: "C:\\AtomicRedTeam\\{{ item }}"
+    state: directory
+  with_items:
+    - atomics
+    - ExternalPayloads
+    - invoke-atomicredteam
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Télécharger module PowerShell-YAML
+  win_get_url:
+    url: https://github.com/cloudbase/powershell-yaml/archive/refs/heads/master.zip
+    dest: C:\Windows\Temp\powershell-yaml.zip
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Créer dossier pour modules PowerShell
+  win_shell: |
+    $modulePath = "$HOME\Documents\WindowsPowerShell\Modules"
+    if (-not (Test-Path $modulePath)) {
+      New-Item -Path $modulePath -ItemType Directory -Force
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Extraire et installer PowerShell-YAML
+  win_shell: |
+    Expand-Archive -Path C:\Windows\Temp\powershell-yaml.zip -DestinationPath C:\Windows\Temp\ -Force
+    $source = "C:\Windows\Temp\powershell-yaml-master"
+    $destination = "$HOME\Documents\WindowsPowerShell\Modules\powershell-yaml"
+    
+    if (Test-Path $destination) {
+      Remove-Item -Path $destination -Recurse -Force
+    }
+    
+    New-Item -Path $destination -ItemType Directory -Force
+    Copy-Item -Path "$source\*" -Destination $destination -Recurse -Force
+    Write-Output "Module PowerShell-YAML installé"
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: yaml_module_result
+- name: Afficher le résultat de l'installation de PowerShell-YAML
+  debug:
+    var: yaml_module_result.stdout_lines
+  when: yaml_module_result is defined
+
+- name: Télécharger Invoke-AtomicRedTeam
+  win_get_url:
+    url: https://github.com/redcanaryco/invoke-atomicredteam/archive/refs/heads/master.zip
+    dest: C:\Windows\Temp\invoke-atomicredteam.zip
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Extraire Invoke-AtomicRedTeam
+  win_shell: |
+    Expand-Archive -Path C:\Windows\Temp\invoke-atomicredteam.zip -DestinationPath C:\Windows\Temp\ -Force
+    $source = "C:\Windows\Temp\invoke-atomicredteam-master"
+    
+    Copy-Item -Path "$source\*" -Destination "C:\AtomicRedTeam\invoke-atomicredteam" -Recurse -Force
+    Write-Output "Invoke-AtomicRedTeam extrait et copié"
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: invoke_atomic_extract_result
+- name: Télécharger les Atomic tests
+  win_get_url:
+    url: https://github.com/redcanaryco/atomic-red-team/archive/refs/heads/master.zip
+    dest: C:\Windows\Temp\atomic-red-team.zip
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+- name: Désactiver temporairement Windows Defender
+  win_shell: |
+    try {
+      Set-MpPreference -DisableRealtimeMonitoring $true
+      Write-Output "Protection en temps réel de Windows Defender désactivée temporairement"
+    } catch {
+      Write-Output "Erreur lors de la désactivation de Windows Defender: $_"
+      exit 1
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: defender_disable_result
+- name: Afficher le résultat de la désactivation de Windows Defender
+  debug:
+    var: defender_disable_result.stdout_lines
+  when: defender_disable_result is defined
+
+- name: Extraire et configurer les Atomic tests
+  win_command: powershell.exe -Command "Expand-Archive -Path C:\Windows\Temp\atomic-red-team.zip -DestinationPath C:\Windows\Temp\ -Force"
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: atomic_extract_result
+- name: Copier les tests atomiques vers le dossier final
+  win_command: powershell.exe -Command "Copy-Item -Path 'C:\Windows\Temp\atomic-red-team-master\atomics' -Destination 'C:\AtomicRedTeam\' -Recurse -Force"
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: atomic_tests_result
+  ignore_errors: yes
+
+- name: Réactiver Windows Defender après copie (si nécessaire pour la sécurité)
+  win_shell: |
+    try {
+      Set-MpPreference -DisableRealtimeMonitoring $false
+      Write-Output "Protection en temps réel de Windows Defender réactivée"
+    } catch {
+      Write-Output "Erreur lors de la réactivation de Windows Defender: $_"
+      exit 0
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: defender_enable_result
+  when: atomic_tests_result is defined
+
+- name: Importer le module Invoke-AtomicRedTeam
+  win_shell: |
+    try {
+      Import-Module "C:\AtomicRedTeam\invoke-atomicredteam\Invoke-AtomicRedTeam.psd1" -Force
+      Write-Output "Module Invoke-AtomicRedTeam importé avec succès"
+    } catch {
+      Write-Output "Erreur lors de l'importation du module: $_"
+      exit 1
+    }
+  delegate_to: "{{ vm_ip_result.stdout }}"
+  vars:
+    ansible_user: "{{ winrm_user_final }}"
+    ansible_password: "{{ winrm_pass_final }}"
+    ansible_connection: winrm
+    ansible_winrm_transport: basic
+    ansible_winrm_server_cert_validation: ignore
+    ansible_port: 5985
+  register: import_module_result
+- name: Afficher le résultat de l'importation du module
+  debug:
+    var: import_module_result.stdout_lines
+  when: import_module_result is defined
+
+- name: Créer un snapshot de la VM avant de l'éteindre
+  shell: sudo VBoxManage snapshot "sandbox" take "Snapshot1" --description "snapshot before the mess"
+  become: yes
+  changed_when: true
+
+- name: Éteindre la VM proprement (si elle est allumée)
+  shell: |
+    VM_STATE=$(sudo VBoxManage showvminfo "sandbox" --machinereadable | grep -i VMState= | cut -d'=' -f2 | tr -d '"')
+    if [ "$VM_STATE" = "running" ]; then
+      sudo VBoxManage controlvm "sandbox" poweroff
+    fi
+  changed_when: true
+  become: yes
+
+- name: Attente pour stabiliser les fichiers .vbox
+  pause:
+    seconds: 5
+
+- name: Enregistrer la VM si elle n'est pas déjà enregistrée
+  shell: |
+    if ! sudo VBoxManage list vms | grep -q '"sandbox"'; then
+      sudo VBoxManage registervm "/home/purplelab/VirtualBox VMs/sandbox/sandbox.vbox"
+    fi
+  register: vm_register_result
+  retries: 3
+  delay: 5
+  until: vm_register_result.rc == 0
+  ignore_errors: yes
+  become: yes

@@ -1,0 +1,41 @@
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.hostname = "purplelab-jammy"
+
+  # Resize primary disk (requires vagrant-disksize plugin).
+  if Vagrant.has_plugin?("vagrant-disksize")
+    config.disksize.size = "200GB"
+  else
+    warn "vagrant-disksize plugin not installed; disk size will stay default."
+  end
+
+  # Bridge VM to the host's eth0 (VirtualBox "Bridged Adapter").
+  # If your host interface isn't actually named "eth0", change this to match
+  # (e.g., "enp3s0", "wlp2s0", etc.).
+  config.vm.network "public_network", bridge: "eth0"
+
+  # Mount the PurpleLab repo root into the VM for easy iteration/testing.
+  # Host path: /home/humm/Tools/PurpleLab
+  # Guest path: /purplelab_host
+  config.vm.synced_folder "..", "/purplelab_host"
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.name = "purplelab-jammy"
+    vb.gui = false
+    # PurpleLab's installer enforces >= ~8GB RAM and needs nested virtualization
+    # to run the Windows Sandbox VM under VirtualBox.
+    vb.cpus = 8
+    vb.memory = 12288
+    vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
+    # Allow nested bridged traffic for the sandbox VM.
+    vb.customize ["modifyvm", :id, "--nicpromisc2", "allow-all"]
+  end
+
+  config.vm.provision "shell", inline: <<-SHELL
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends \\
+      ca-certificates curl vim-tiny net-tools
+  SHELL
+end

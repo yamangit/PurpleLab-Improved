@@ -1,0 +1,58 @@
+# ============================== Winlogbeat Configuration ================================
+
+# Collecte des journaux d'événements Windows et journaux spécifiques (Sysmon, RDP, PowerShell)
+winlogbeat.event_logs:
+  - name: Application
+    ignore_older: 72h
+  - name: System
+    ignore_older: 72h
+  - name: Security
+    ignore_older: 72h
+  - name: Microsoft-Windows-Sysmon/Operational
+    ignore_older: 72h
+  - name: Microsoft-Windows-PowerShell/Operational
+    ignore_older: 72h
+  - name: Microsoft-Windows-TerminalServices-LocalSessionManager/Operational
+    ignore_older: 72h
+  - name: Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational
+    ignore_older: 72h
+
+# ============================== Output OpenSearch ======================================
+
+# OpenSearch OSS output (via Elasticsearch output plugin)
+output.elasticsearch:
+  hosts: ["https://{{ opensearch_host }}:9200"]
+  username: "admin"
+  password: "admin123"
+  ssl.verification_mode: none
+  allow_older_versions: true
+  index: "winlogbeat-%{+yyyy.MM.dd}"
+
+# ============================== Setup Section ==========================================
+
+# Ne pas envoyer de templates (on les gère nous-mêmes si besoin)
+setup.template.enabled: false
+
+# Désactiver ILM (Index Lifecycle Management)
+setup.ilm.enabled: false
+
+# Ne pas configurer Kibana
+setup.kibana.host: ""
+setup.dashboards.enabled: false
+
+# ============================== Logging Configuration ===================================
+
+logging.level: info
+logging.to_files: true
+logging.files:
+  path: C:/ProgramData/winlogbeat/logs
+  name: winlogbeat
+  keepfiles: 7
+  permissions: 0644
+
+# ============================== Processors =============================================
+
+processors:
+  - add_host_metadata: ~
+  - add_process_metadata: ~
+  - add_locale: ~
