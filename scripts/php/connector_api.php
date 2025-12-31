@@ -241,10 +241,12 @@ switch ($action) {
                     if (isset($connectorData['host'])) {
                         // Extract host and port from the URL if it contains a protocol
                         $host = $connectorData['host'];
+                        $scheme = '';
                         $port = isset($connectorData['port']) && !empty($connectorData['port']) ? $connectorData['port'] : '8089';
                         
                         // Remove protocol prefix if present
                         if (preg_match('~^https?://(.+)$~i', $host, $matches)) {
+                            $scheme = stripos($host, 'http://') === 0 ? 'http' : 'https';
                             $host = $matches[1];
                         }
                         
@@ -254,8 +256,14 @@ switch ($action) {
                             $port = $matches[2];
                         }
                         
+                        if ($port === '8000') {
+                            $port = '8089';
+                        }
                         file_put_contents($tempEnvFile, "export SPLUNK_HOST=\"{$host}\"\n", FILE_APPEND);
                         file_put_contents($tempEnvFile, "export SPLUNK_PORT=\"{$port}\"\n", FILE_APPEND);
+                        if (!empty($scheme)) {
+                            file_put_contents($tempEnvFile, "export SPLUNK_SCHEME=\"{$scheme}\"\n", FILE_APPEND);
+                        }
                         log_message("Setting SPLUNK_HOST to {$host} and SPLUNK_PORT to {$port}");
                     }
                     

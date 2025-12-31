@@ -27,18 +27,29 @@ if 'SPLUNK_PASSWORD' in os.environ:
     print("Using SPLUNK_PASSWORD from environment (value hidden)")
 
 def connect_to_splunk(host, port, username, password, ssl_enabled=True):
-    scheme = "https" if ssl_enabled else "http"
+    scheme = os.environ.get("SPLUNK_SCHEME", "https" if ssl_enabled else "http")
     if host.startswith("http://"):
+        scheme = "http"
         host = host.split("://")[1]
     elif host.startswith("https://"):
+        scheme = "https"
         host = host.split("://")[1]
-    return client.connect(
-        host=host,
-        port=port,
-        username=username,
-        password=password,
-        scheme=scheme
-    )
+    if str(port) == "8000":
+        port = "8089"
+    def _connect(use_scheme):
+        return client.connect(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            scheme=use_scheme
+        )
+    try:
+        return _connect(scheme)
+    except Exception:
+        if scheme == "https":
+            return _connect("http")
+        raise
 
 def list_saved_alerts(service):
     print("\nList of saved alerts:")

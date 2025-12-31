@@ -190,9 +190,14 @@ def test_splunk_connection(config):
         port = config.get("port", "8089")
         username = config.get("username", "")
         password = config.get("password", "")
+        scheme = config.get("scheme", "https")
         
         # Remove protocol if present
-        if host.startswith("http://") or host.startswith("https://"):
+        if host.startswith("http://"):
+            scheme = "http"
+            host = host.split("://")[1]
+        elif host.startswith("https://"):
+            scheme = "https"
             host = host.split("://")[1]
         
         # Remove port if included in host
@@ -201,15 +206,29 @@ def test_splunk_connection(config):
             host = host_parts[0]
             if len(host_parts) > 1 and host_parts[1].isdigit():
                 port = host_parts[1]
+        if str(port) == "8000":
+            port = "8089"
         
         # Test connection
-        service = client.connect(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            scheme="https"
-        )
+        def connect_with_scheme(use_scheme):
+            return client.connect(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                scheme=use_scheme
+            )
+        
+        try:
+            service = connect_with_scheme(scheme)
+        except Exception as e1:
+            if scheme == "https":
+                try:
+                    service = connect_with_scheme("http")
+                except Exception as e2:
+                    return False, f"Error connecting to Splunk: {str(e1)}; fallback http failed: {str(e2)}"
+            else:
+                return False, f"Error connecting to Splunk: {str(e1)}"
         
         # Check if we can access apps (a basic operation)
         apps = service.apps
