@@ -604,13 +604,17 @@ switch ($action) {
         ]);
         $result = curl_exec($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curl_error = curl_error($ch);
         curl_close($ch);
         if ($http_code === 200) {
             echo $result;
         } else {
+            log_message("execute_payload failed: http_code=$http_code, curl_error=$curl_error, response=$result");
             echo json_encode([
                 'status' => 'error',
-                'message' => 'Failed to execute payload'
+                'message' => 'Failed to execute payload',
+                'http_code' => $http_code,
+                'details' => $result ?: $curl_error
             ]);
         }
         exit;

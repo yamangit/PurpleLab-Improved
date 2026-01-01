@@ -47,6 +47,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         
         if (!$result) {
             echo "Error adding payload: " . pg_last_error($conn);
+        } else {
+            @unlink('/var/www/html/cache/payload_count.cache');
         }
     }
    
@@ -59,6 +61,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         
         if (!$result) {
             echo "Error deleting payload: " . pg_last_error($conn);
+        } else {
+            @unlink('/var/www/html/cache/payload_count.cache');
         }
     }
    

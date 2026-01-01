@@ -748,11 +748,21 @@ def execute_payload():
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'  # Désactiver l'affichage de progression
+$InformationPreference = 'Continue'
 
 # Balise de début pour identifier le début des résultats réels
 Write-Output "BEGIN_RESULTS"
 try {{
+    $results = & {{
 {payload_content}
+    }} 6>&1 | ForEach-Object {{
+        if ($_ -is [System.Management.Automation.InformationRecord]) {{
+            $_.MessageData.Message
+        }} else {{
+            $_
+        }}
+    }}
+    if ($results) {{ $results | ForEach-Object {{ Write-Output $_ }} }}
 }} catch {{
     Write-Output "ERREUR: $($_.Exception.Message)"
 }}
@@ -766,15 +776,27 @@ Write-Output "END_RESULTS"
     try:
 
         result = subprocess.run(
-            ['VBoxManage', 'guestcontrol', 'sandbox', 
-             '--username', 'oem', '--password', 'oem', 
-             'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', 
+            ['VBoxManage', 'guestcontrol', 'sandbox',
+             '--username', 'oem', '--password', 'oem',
+             'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
              '--', 'powershell.exe', '-NoProfile', '-EncodedCommand', encoded_ps],
-            check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=False  
+            text=False,
+            env=VBOX_ENV
         )
+        if result.returncode != 0:
+            result = subprocess.run(
+                ['sudo', 'VBoxManage', 'guestcontrol', 'sandbox',
+                 '--username', 'oem', '--password', 'oem',
+                 'run', '--exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+                 '--', 'powershell.exe', '-NoProfile', '-EncodedCommand', encoded_ps],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                env=VBOX_ENV
+            )
+        result.check_returncode()
         
         stdout_decoded = result.stdout.decode('cp1252', errors='replace')
         stderr_decoded = result.stderr.decode('cp1252', errors='replace')
@@ -788,8 +810,7 @@ Write-Output "END_RESULTS"
             stdout_decoded = stdout_decoded[start_idx:end_idx].strip()
         
 
-        if stderr_decoded and stderr_decoded.strip().startswith("<"):
-
+        if stderr_decoded and ("<Objs" in stderr_decoded or stderr_decoded.strip().startswith("<")):
             stderr_decoded = ""
         
         return jsonify({
@@ -801,7 +822,7 @@ Write-Output "END_RESULTS"
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode('cp1252', errors='replace') if e.stderr else ""
         
-        if stderr and stderr.strip().startswith("<"):
+        if stderr and ("<Objs" in stderr or stderr.strip().startswith("<")):
             stderr = "Commande exécutée avec des avertissements."
         
         return jsonify({
